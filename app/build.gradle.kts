@@ -5,12 +5,16 @@ plugins {
 
 android {
     namespace = "com.arcane78.githubexplorer"
-    compileSdk = 34
+    compileSdk = 35
+
+    viewBinding{
+        enable = true
+    }
 
     defaultConfig {
         applicationId = "com.arcane78.githubexplorer"
         minSdk = 24
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 1
         versionName = "1.0"
 
@@ -42,7 +46,17 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.activity)
     implementation(libs.androidx.constraintlayout)
+    implementation(libs.androidx.swiperefreshlayout)
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
+
+    //Dependencies required
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.retrofit)
+    implementation(libs.retrofit2.converter.gson)
+    implementation(libs.gson)
+    implementation(libs.material)
+    implementation(libs.glide)
+    implementation(libs.androidx.lifecycle.viewmodel.ktx)
 }
