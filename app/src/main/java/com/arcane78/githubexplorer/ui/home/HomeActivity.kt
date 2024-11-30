@@ -6,6 +6,7 @@ import android.text.TextWatcher
 import android.view.View
 import androidx.activity.viewModels
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.isVisible
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -27,8 +28,6 @@ class HomeActivity : AppCompatActivity() {
         HomeViewModel.provideFactory(GitHubRepository)
     }
     private lateinit var adapter: UsersAdapter
-    private var isFabMenuExpanded = false
-    private val searchQueryFlow = MutableStateFlow("")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -47,20 +46,22 @@ class HomeActivity : AppCompatActivity() {
     }
 
     private fun setupRecyclerView() {
-        adapter = UsersAdapter(onRetry = { viewModel.retry() })
+        adapter = UsersAdapter(
+            onInitialRetry = { viewModel.retry() },
+            onPaginationRetry = { viewModel.retryPagination() }
+        )
 
         binding.usersRecyclerView.apply {
             layoutManager = LinearLayoutManager(this@HomeActivity)
             adapter = this@HomeActivity.adapter
             hideKeyboardOnScroll()
-            addPaginationScrollListener()
+            setupPagination()
         }
     }
 
-    private fun RecyclerView.addPaginationScrollListener() {
+    private fun RecyclerView.setupPagination() {
         addOnScrollListener(object : RecyclerView.OnScrollListener() {
             override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
-                super.onScrolled(recyclerView, dx, dy)
                 if (shouldLoadMoreItems()) {
                     loadMoreItems()
                 }
@@ -78,76 +79,72 @@ class HomeActivity : AppCompatActivity() {
                 firstVisibleItem + visibleItemCount >= totalItemCount - 5
     }
 
-    private fun loadMoreItems() {
-        if (binding.searchEditText.text.isNotEmpty()) {
-            viewModel.loadMoreSearchResults()
-        } else {
-            viewModel.loadMoreUsers()
+    private fun setupSwipeRefresh() {
+        binding.swipeRefreshLayout.setOnRefreshListener {
+            handleRefresh()
         }
     }
 
-    private fun setupSwipeRefresh() {
-        binding.swipeRefreshLayout.setOnRefreshListener {
-            if (binding.searchEditText.text.isNotEmpty()) {
-                viewModel.searchUsers(binding.searchEditText.text.toString(), true)
-            } else {
-                viewModel.retry()
-            }
-            binding.swipeRefreshLayout.isRefreshing = false
+    private fun handleRefresh() {
+        if (binding.searchEditText.text.isNotEmpty()) {
+            viewModel.searchUsers(binding.searchEditText.text.toString(), true)
+        } else {
+            viewModel.retry()
         }
+        binding.swipeRefreshLayout.isRefreshing = false
     }
 
     private fun setupSearch() {
+        setupSearchView()
+        setupClearButton()
+    }
+
+    private fun setupSearchView() {
         binding.searchEditText.addTextChangedListener(object : TextWatcher {
             override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
 
             override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
-                binding.clearSearchButton.visibility =
-                    if (s.isNullOrEmpty()) View.GONE else View.VISIBLE
+                updateClearButtonVisibility(s)
             }
 
             override fun afterTextChanged(s: Editable?) {
-                searchQueryFlow.value = s?.toString() ?: ""
+                viewModel.updateSearchQuery(s?.toString() ?: "")
             }
         })
+    }
 
+    private fun observeViewModelSearchQuery() {
+        lifecycleScope.launch {
+            viewModel.searchQueryFlow.collect { query ->
+                if (query != binding.searchEditText.text.toString()) {
+                    binding.searchEditText.setText(query)
+                    binding.searchEditText.setSelection(query.length)
+                }
+            }
+        }
+    }
+
+    private fun updateClearButtonVisibility(text: CharSequence?) {
+        binding.clearSearchButton.visibility =
+            if (text.isNullOrEmpty()) View.GONE else View.VISIBLE
+    }
+
+    private fun setupClearButton() {
         binding.clearSearchButton.setOnClickListener {
-            binding.searchEditText.setText("")
-            viewModel.clearSearch()
+            clearSearch()
         }
     }
 
     private fun setupFabMenu() {
-        binding.menuFab.setOnClickListener {
-            if (isFabMenuExpanded) collapseFabMenu() else expandFabMenu()
-        }
-
         binding.themeFab.setOnClickListener {
             toggleTheme()
-            collapseFabMenu()
         }
-    }
-
-    private fun expandFabMenu() {
-        isFabMenuExpanded = true
-        binding.themeFab.show()
-        binding.futureActionFab.show()
-    }
-
-    private fun collapseFabMenu() {
-        isFabMenuExpanded = false
-        binding.themeFab.hide()
-        binding.futureActionFab.hide()
-    }
-
-    private fun showEmptyState(show: Boolean) {
-        binding.emptyStateLayout.visibility = if (show) View.VISIBLE else View.GONE
-        binding.usersRecyclerView.visibility = if (show) View.GONE else View.VISIBLE
     }
 
     private fun observeData() {
         observeUiState()
-        observeSearch()
+        viewModel.observeSearchQuery()
+        observeViewModelSearchQuery()
     }
 
     private fun observeUiState() {
@@ -160,37 +157,38 @@ class HomeActivity : AppCompatActivity() {
 
     private fun handleUiState(items: List<ListItemState>) {
         when {
-            items.isEmpty() -> handleEmptyList()
-            items.size == 1 -> handleSingleItem(items.first())
-            else -> handleUsersList(items)
-        }
-    }
-
-    private fun handleEmptyList() {
-        toggleLoadingState(true)
-    }
-
-    private fun handleSingleItem(item: ListItemState) {
-        when (item) {
-            is ListItemState.LoadingItemState -> {
-                toggleLoadingState(true)
+            items.isEmpty() || (items.size == 1 && items.first() is ListItemState.LoadingItemState) -> {
+                if (!binding.emptyStateLayout.isVisible) {
+                    toggleLoadingState(true)
+                }
             }
-            is ListItemState.ErrorItemState -> {
-                toggleLoadingState(false)
-                showEmptyState(true)
-                binding.emptyStateMessage.text = item.message
-                binding.retryButton.setOnClickListener { viewModel.retry() }
+
+            items.first() is ListItemState.ErrorItemState && items.size == 1 -> {
+                handleErrorState(items.first() as ListItemState.ErrorItemState)
             }
-            is ListItemState.UserItemState -> {
-                handleUsersList(listOf(item))
+
+            else -> {
+                handleContentState(items)
             }
         }
     }
 
-    private fun handleUsersList(items: List<ListItemState>) {
+    private fun handleErrorState(errorState: ListItemState.ErrorItemState) {
+        toggleLoadingState(false)
+        showEmptyState(true)
+        binding.emptyStateMessage.text = errorState.message
+        binding.retryButton.setOnClickListener { viewModel.retry() }
+    }
+
+    private fun handleContentState(items: List<ListItemState>) {
         toggleLoadingState(false)
         showEmptyState(false)
         adapter.updateItems(items)
+    }
+
+    private fun showEmptyState(show: Boolean) {
+        binding.emptyStateLayout.visibility = if (show) View.VISIBLE else View.GONE
+        binding.usersRecyclerView.visibility = if (show) View.GONE else View.VISIBLE
     }
 
     private fun toggleLoadingState(isLoading: Boolean) {
@@ -201,20 +199,17 @@ class HomeActivity : AppCompatActivity() {
         }
     }
 
-    @OptIn(FlowPreview::class)
-    private fun observeSearch() {
-        lifecycleScope.launch {
-            searchQueryFlow
-                .debounce(300)
-                .distinctUntilChanged()
-                .collect { query ->
-                    if (query.isBlank()) {
-                        viewModel.clearSearch()
-                    } else {
-                        viewModel.searchUsers(query.trim(), isNewSearch = true)
-                    }
-                }
+    private fun loadMoreItems() {
+        if (binding.searchEditText.text.isNotEmpty()) {
+            viewModel.loadMoreSearchResults()
+        } else {
+            viewModel.loadMoreUsers()
         }
+    }
+
+    private fun clearSearch() {
+        binding.searchEditText.setText("")
+        viewModel.clearSearch()
     }
 
     private fun toggleTheme() {

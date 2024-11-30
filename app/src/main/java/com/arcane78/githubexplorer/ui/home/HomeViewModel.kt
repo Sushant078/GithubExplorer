@@ -8,30 +8,58 @@ import com.arcane78.githubexplorer.models.UserResponse
 import com.arcane78.githubexplorer.models.response.SearchUsersResponse
 import com.arcane78.githubexplorer.repository.GitHubRepository
 import com.arcane78.githubexplorer.ui.home.states.ListItemState
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 
 class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
     private val _uiState = MutableStateFlow<List<ListItemState>>(emptyList())
     val uiState = _uiState.asStateFlow()
 
-    // State flags
     private var isLoading = false
     private var isSearchActive = false
+    private var lastUserId = 0
+    private var lastSearchPage = 1
 
-    // Search state
     private var searchJob: Job? = null
     private var currentSearchQuery = ""
-    private var currentSearchPage = 1
     private var hasMoreSearchResults = true
     private var totalSearchResults = 0
 
-    // Data holders
     private val usersList = mutableListOf<UserResponse>()
     private val searchResults = mutableListOf<UserResponse>()
-    private var lastUserId = 0
+
+
+    private val _searchQueryFlow = MutableStateFlow("")
+    val searchQueryFlow = _searchQueryFlow.asStateFlow()
+
+    private val _intermediateQueryFlow = MutableStateFlow("")
+
+    @OptIn(FlowPreview::class)
+    fun observeSearchQuery() {
+        viewModelScope.launch {
+            _intermediateQueryFlow
+                .debounce(300)
+                .distinctUntilChanged()
+                .collect { query ->
+                    _searchQueryFlow.value = query
+
+                    if (query.isBlank()) {
+                        clearSearch()
+                    } else {
+                        searchUsers(query.trim(), isNewSearch = true)
+                    }
+                }
+        }
+    }
+
+    fun updateSearchQuery(query: String) {
+        _intermediateQueryFlow.value = query
+    }
 
     init {
         loadInitialUsers()
@@ -42,9 +70,12 @@ class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
         isLoading = true
 
         viewModelScope.launch {
-            setLoadingState()
             repository.getAllUsers(since = 0).collect { response ->
-                handleInitialUsersResponse(response)
+                when (response) {
+                    is ApiResponse.Success -> handleInitialUsersSuccess(response.data)
+                    is ApiResponse.Error -> handleInitialError(response.message)
+                    is ApiResponse.Loading -> handleInitialLoading()
+                }
             }
         }
     }
@@ -56,7 +87,11 @@ class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
         viewModelScope.launch {
             appendLoadingItem()
             repository.getAllUsers(since = lastUserId).collect { response ->
-                handleLoadMoreUsersResponse(response)
+                when (response) {
+                    is ApiResponse.Success -> handleLoadMoreSuccess(response.data)
+                    is ApiResponse.Error -> handleLoadMoreError(response.message)
+                    is ApiResponse.Loading -> Unit
+                }
             }
         }
     }
@@ -79,106 +114,38 @@ class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
         }
     }
 
-    fun clearSearch() {
-        resetSearchState()
-        _uiState.value = usersList.map { ListItemState.UserItemState(it) }
-    }
-
-    fun retry() {
-        if (isSearchActive) {
-            searchUsers(currentSearchQuery, isNewSearch = true)
-        } else {
-            loadInitialUsers()
+    private fun handleInitialUsersSuccess(users: List<UserResponse>?) {
+        users?.let {
+            usersList.clear()
+            usersList.addAll(it)
+            lastUserId = usersList.lastOrNull()?.id ?: 0
+            updateUiState(usersList.map { ListItemState.UserItemState(it) })
         }
+        isLoading = false
     }
 
-    private fun setLoadingState() {
-        _uiState.value = listOf(ListItemState.LoadingItemState)
-    }
-
-    private fun appendLoadingItem() {
-        val currentItems = _uiState.value.toMutableList()
-        currentItems.add(ListItemState.LoadingItemState)
-        _uiState.value = currentItems
-    }
-
-    private fun handleInitialUsersResponse(response: ApiResponse<List<UserResponse>?>) {
-        when (response) {
-            is ApiResponse.Success -> {
-                response.data?.let { users ->
-                    usersList.clear()
-                    usersList.addAll(users)
-                    lastUserId = usersList.lastOrNull()?.id ?: 0
-                    _uiState.value = usersList.map { ListItemState.UserItemState(it) }
-                }
-                isLoading = false
-            }
-            is ApiResponse.Error -> {
-                _uiState.value = listOf(ListItemState.ErrorItemState(response.message))
-                isLoading = false
-            }
-            is ApiResponse.Loading -> Unit
+    private fun handleLoadMoreSuccess(newUsers: List<UserResponse>?) {
+        newUsers?.let {
+            usersList.addAll(it)
+            lastUserId = usersList.lastOrNull()?.id ?: lastUserId
+            updateUiState(usersList.map { ListItemState.UserItemState(it) })
         }
+        isLoading = false
     }
 
-    private fun handleLoadMoreUsersResponse(response: ApiResponse<List<UserResponse>?>) {
-        when (response) {
-            is ApiResponse.Success -> {
-                response.data?.let { newUsers ->
-                    usersList.addAll(newUsers)
-                    lastUserId = usersList.lastOrNull()?.id ?: 0
-                    _uiState.value = usersList.map { ListItemState.UserItemState(it) }
-                }
-                isLoading = false
-            }
-            is ApiResponse.Error -> {
-                _uiState.value = buildErrorState(usersList, response.message)
-                isLoading = false
-            }
-            is ApiResponse.Loading -> Unit
-        }
+    private fun handleInitialError(message: String) {
+        updateUiState(listOf(ListItemState.ErrorItemState(message)))
+        isLoading = false
     }
 
-    private fun shouldSkipSearch(query: String, isNewSearch: Boolean): Boolean {
-        return (!isNewSearch && (!hasMoreSearchResults || isLoading))
+    private fun handleLoadMoreError(message: String) {
+        updateUiState(buildErrorState(usersList, message))
+        isLoading = false
     }
 
-    private fun setupSearchState(query: String, isNewSearch: Boolean) {
-        if (isNewSearch) {
-            searchJob?.cancel()
-            resetSearchForNewQuery(query)
-            setLoadingState()
-        } else if (!isLoading) {
-            appendLoadingItem()
-        }
-
-        isSearchActive = true
-        isLoading = true
-    }
-
-    private fun resetSearchForNewQuery(query: String) {
-        currentSearchQuery = query
-        currentSearchPage = 1
-        searchResults.clear()
-        hasMoreSearchResults = true
-        totalSearchResults = 0
-    }
-
-    private fun resetSearchState() {
-        isSearchActive = false
-        currentSearchQuery = ""
-        currentSearchPage = 1
-        searchResults.clear()
-        hasMoreSearchResults = true
-        totalSearchResults = 0
-    }
-
-    private fun executeSearch() {
-        searchJob = viewModelScope.launch {
-            repository.searchUsers(query = currentSearchQuery, page = currentSearchPage)
-                .collect { response ->
-                    handleSearchResponse(response)
-                }
+    private fun handleInitialLoading() {
+        if (_uiState.value.isEmpty()) {
+            updateUiState(listOf(ListItemState.LoadingItemState))
         }
     }
 
@@ -198,15 +165,33 @@ class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
         isLoading = false
     }
 
+    private fun handleSearchError(response: ApiResponse.Error) {
+        updateUiState(if (lastSearchPage == 1) {
+            listOf(ListItemState.ErrorItemState(response.message))
+        } else {
+            buildErrorState(searchResults, response.message)
+        })
+        isLoading = false
+    }
+
+    private fun executeSearch() {
+        searchJob = viewModelScope.launch {
+            repository.searchUsers(query = currentSearchQuery, page = lastSearchPage)
+                .collect { response ->
+                    handleSearchResponse(response)
+                }
+        }
+    }
+
     private fun updateSearchState(searchResponse: SearchUsersResponse) {
-        if (currentSearchPage == 1) {
+        if (lastSearchPage == 1) {
             totalSearchResults = searchResponse.totalCount
         }
     }
 
     private fun updateSearchResults(newUsers: List<UserResponse>) {
         when {
-            currentSearchPage == 1 && (newUsers.isEmpty() || totalSearchResults == 0) -> {
+            lastSearchPage == 1 && (newUsers.isEmpty() || totalSearchResults == 0) -> {
                 handleEmptySearchResults()
             }
             newUsers.isEmpty() -> {
@@ -219,31 +204,89 @@ class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
     }
 
     private fun handleEmptySearchResults() {
-        _uiState.value = listOf(ListItemState.ErrorItemState("No users found matching '$currentSearchQuery'"))
+        updateUiState(listOf(ListItemState.ErrorItemState("No users found matching '$currentSearchQuery'")))
         hasMoreSearchResults = false
     }
 
     private fun handleNoMoreSearchResults() {
         hasMoreSearchResults = false
-        _uiState.value = searchResults.map { ListItemState.UserItemState(it) }
+        updateUiState(searchResults.map { ListItemState.UserItemState(it) })
     }
 
     private fun handleValidSearchResults(newUsers: List<UserResponse>) {
+        if (lastSearchPage == 1) {
+            searchResults.clear()
+        }
         searchResults.addAll(newUsers)
         hasMoreSearchResults = searchResults.size < totalSearchResults
         if (hasMoreSearchResults) {
-            currentSearchPage++
+            lastSearchPage++
         }
-        _uiState.value = searchResults.map { ListItemState.UserItemState(it) }
+        updateUiState(searchResults.map { ListItemState.UserItemState(it) })
     }
 
-    private fun handleSearchError(response: ApiResponse.Error) {
-        _uiState.value = if (currentSearchPage == 1) {
-            listOf(ListItemState.ErrorItemState(response.message))
-        } else {
-            buildErrorState(searchResults, response.message)
+    private fun appendLoadingItem() {
+        val currentItems = _uiState.value.toMutableList()
+        currentItems.add(ListItemState.LoadingItemState)
+        updateUiState(currentItems)
+    }
+
+    private fun shouldSkipSearch(query: String, isNewSearch: Boolean): Boolean {
+        return (!isNewSearch && (!hasMoreSearchResults || isLoading))
+    }
+
+    private fun setupSearchState(query: String, isNewSearch: Boolean) {
+        if (isNewSearch) {
+            searchJob?.cancel()
+            resetSearchForNewQuery(query)
+            updateUiState(listOf(ListItemState.LoadingItemState))
+        } else if (!isLoading) {
+            appendLoadingItem()
         }
-        isLoading = false
+        isSearchActive = true
+        isLoading = true
+    }
+
+    private fun resetSearchForNewQuery(query: String) {
+        currentSearchQuery = query
+        lastSearchPage = 1
+        searchResults.clear()
+        hasMoreSearchResults = true
+        totalSearchResults = 0
+    }
+
+    private fun resetSearchState() {
+        isSearchActive = false
+        currentSearchQuery = ""
+        lastSearchPage = 1
+        searchResults.clear()
+        hasMoreSearchResults = true
+        totalSearchResults = 0
+    }
+
+    fun clearSearch() {
+        resetSearchState()
+        updateUiState(usersList.map { ListItemState.UserItemState(it) })
+    }
+
+    fun retry() {
+        if (isSearchActive) {
+            searchResults.clear()
+            lastSearchPage = 1
+            searchUsers(currentSearchQuery, isNewSearch = true)
+        } else {
+            usersList.clear()
+            lastUserId = 0
+            loadInitialUsers()
+        }
+    }
+
+    fun retryPagination() {
+        if (isSearchActive) {
+            searchUsers(currentSearchQuery, isNewSearch = false)
+        } else {
+            loadMoreUsers()
+        }
     }
 
     private fun buildErrorState(
@@ -253,6 +296,12 @@ class HomeViewModel(private val repository: GitHubRepository) : ViewModel() {
         addAll(existingItems.map { ListItemState.UserItemState(it) })
         add(ListItemState.ErrorItemState(errorMessage))
     }
+
+    private fun updateUiState(newState: List<ListItemState>) {
+        _uiState.value = newState
+    }
+
+
 
     companion object {
         fun provideFactory(
